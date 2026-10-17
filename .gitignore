@@ -1,0 +1,41 @@
+# Maven
+target/
+**/target/
+!.mvn/wrapper/maven-wrapper.jar
+.m2/
+
+# Gradle & Android
+.gradle/
+**/build/
+build/
+local.properties
+.kotlin/
+**/.kotlin/
+
+# Binaries
+*.apk
+
+# IDEs & Editors
+.idea/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.springBeans
+.sts4-cache
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# Agent / Tooling metadata
+.agents/
+.gemini/
+
+# OS artifacts
+.DS_Store
+Thumbs.db

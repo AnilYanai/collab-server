@@ -1,0 +1,262 @@
+================================================================================
+STATE PRESERVER - 4 PROBLEMS IDENTIFIED & ARCHITECTURAL SOLUTIONS
+File: session-engine/src/main/java/com/anilyanai/engine/session/StatePreserver.java
+================================================================================
+
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY
+--------------------------------------------------------------------------------
+The StatePreserver class is responsible for managing packet replay history in
+collaborative sessions (e.g. late-joiner state recovery). The architecture was
+designed around a "Polymorphic Zero-Condition" philosophy to eliminate branching
+conditions (e.g., if (preserveState)) on high-frequency packet fan-out loops.
+
+However, an in-depth code audit of StatePreserver revealed 4 critical flaws
+spanning memory waste, object allocation overhead, API limitation, and data
+integrity / concurrency vulnerabilities.
+
+--------------------------------------------------------------------------------
+2. PROBLEM BREAKDOWN & SOLUTIONS
+--------------------------------------------------------------------------------
+
+PROBLEM 1: Heavy Memory Waste & Useless Buffer Allocation on Ephemeral Sessions
+------------------------------------------------------------------------------
+* What was the problem:
+  In the factory method create(boolean preserveState):
+      public static StatePreserver create(boolean preserveState) {
+          if (preserveState) {
+              return new StatePreserver();
+          } else {
+              return new StatePreserver() {
+                  @Override public void save(byte[] rawBytes) {}
+                  @Override public List<byte[]> getHistory() { return Collections.emptyList(); }
+                  @Override public void clear() {}
+              };
+          }
+      }
+  When preserveState is false, an anonymous subclass of StatePreserver was
+  instantiated. In Java, any subclass constructor implicitly invokes super().
+  Therefore, new StatePreserver() was called, which in turn executed:
+      this(ReplayRingBuffer.DEFAULT_CAPACITY) -> new ReplayRingBuffer(200)
+  This allocated an internal array `new byte[200][]` and a `new Object()` lock
+  for every single ephemeral session.
+  Because the anonymous subclass completely overrides save(), getHistory(), and
+  clear() to be no-ops, this ReplayRingBuffer was NEVER used.
+  In large-scale deployments with thousands of ephemeral rooms (e.g. video/voice
+  streams, transient chat rooms), megabytes of heap memory were wasted on empty,
+  unreachable ring buffers.
+
+* How it was solved:
+  1. Added a package-private/protected constructor:
+         protected StatePreserver(ReplayRingBuffer ringBuffer) {
+             this.ringBuffer = ringBuffer;
+         }
+  2. The dedicated No-Op preserver implementation calls `super(null)`.
+  3. No ReplayRingBuffer, no byte[200][] array, and no lock object are allocated
+     when ephemeral sessions are created.
+
+
+PROBLEM 2: Continuous Allocation & GC Pressure on Ephemeral Rooms (Missing Singleton)
+-------------------------------------------------------------------------------------
+* What was the problem:
+  Every call to `StatePreserver.create(false)` instantiated a brand new anonymous
+  inner class instance (`StatePreserver$1`).
+  A no-op preserver has ZERO mutable state, zero instance variables, and does not
+  vary across sessions. Creating a new heap object every time a client creates or
+  joins an ephemeral room violated the stated Javadoc claim ("zero allocations")
+  and generated needless garbage collection churn in high-throughput room churn.
+
+* How it was solved:
+  1. Implemented the Null Object Pattern via a cached singleton:
+         public static final StatePreserver NO_OP = new NoOpStatePreserver();
+  2. create(false) and create(false, capacity) immediately return NO_OP.
+  3. Provided a static convenience accessor `StatePreserver.empty()`.
+  4. Ephemeral session initialization is now truly zero-allocation (0 B garbage).
+
+
+PROBLEM 3: Factory Method Ignored Custom Buffer Capacity
+--------------------------------------------------------
+* What was the problem:
+  StatePreserver provided a parameterized constructor `public StatePreserver(int capacity)`,
+  allowing custom history depth. However, the recommended factory API only exposed:
+      public static StatePreserver create(boolean preserveState)
+  There was no factory overload accepting a capacity parameter.
+  Any caller following the polymorphic factory pattern was forced to use the
+  hardcoded DEFAULT_CAPACITY (200). If a caller needed 1,000 frames (e.g., complex
+  collaborative whiteboard) or 20 frames (lightweight chat), they were forced to
+  bypass `create()` and directly call `new StatePreserver(capacity)`, completely
+  breaking the polymorphic pattern for ephemeral sessions and leading to bad
+  architectural workarounds. Furthermore, no validation existed for capacity <= 0.
+
+* How it was solved:
+  1. Added overloaded factory method:
+         public static StatePreserver create(boolean preserveState, int capacity) {
+             if (preserveState) {
+                 return new StatePreserver(capacity);
+             }
+             return NO_OP;
+         }
+  2. Added explicit capacity validation checking that capacity > 0, throwing
+     IllegalArgumentException if an invalid capacity is supplied.
+  3. Standardized `create(boolean)` to delegate to `create(preserveState, DEFAULT_CAPACITY)`.
+
+
+PROBLEM 4: Mutable Array Exposure / State Corruption & Missing Null Safety
+--------------------------------------------------------------------------
+* What was the problem:
+  1. Lack of defensive copying in save(byte[] rawBytes):
+         public void save(byte[] rawBytes) {
+             if (rawBytes != null) {
+                 ringBuffer.append(rawBytes);
+             }
+         }
+     The raw array reference `rawBytes` was passed directly into the ReplayRingBuffer.
+     In high-performance Java NIO network architectures, byte buffers and byte[] arrays
+     are frequently recycled, pooled, or reused across read/write cycles.
+     If a caller or transport thread modified `rawBytes` after calling save(), the
+     stored replay history was mutated in-place, causing silent session corruption
+     for future reconnecting clients.
+  2. In `getHistory()` and `clear()`, `ringBuffer` was accessed directly without
+     null-checks. When `ringBuffer` is null (e.g. when unbuffered or subclassed),
+     methods could throw NullPointerException.
+
+* How it was solved:
+  1. Applied defensive copying during save():
+         if (rawBytes != null && ringBuffer != null) {
+             ringBuffer.append(rawBytes.clone());
+         }
+     This guarantees that the recorded session snapshot remains immutable and
+     isolated from any external array manipulation.
+  2. Added null guards in `getHistory()` and `clear()`:
+         public List<byte[]> getHistory() {
+             return ringBuffer != null ? ringBuffer.snapshot() : Collections.emptyList();
+         }
+         public void clear() {
+             if (ringBuffer != null) {
+                 ringBuffer.clear();
+             }
+         }
+
+--------------------------------------------------------------------------------
+3. BEFORE VS. AFTER COMPARISON
+--------------------------------------------------------------------------------
+
+BEFORE:
+--------------------------------------------------------------------------------
+public class StatePreserver {
+    private final ReplayRingBuffer ringBuffer;
+
+    public StatePreserver() {
+        this(ReplayRingBuffer.DEFAULT_CAPACITY);
+    }
+
+    public StatePreserver(int capacity) {
+        this.ringBuffer = new ReplayRingBuffer(capacity);
+    }
+
+    public static StatePreserver create(boolean preserveState) {
+        if (preserveState) {
+            return new StatePreserver();
+        } else {
+            return new StatePreserver() { // <-- Allocates new object and ReplayRingBuffer(200) every time!
+                @Override public void save(byte[] rawBytes) {}
+                @Override public List<byte[]> getHistory() { return Collections.emptyList(); }
+                @Override public void clear() {}
+            };
+        }
+    }
+
+    public void save(byte[] rawBytes) {
+        if (rawBytes != null) {
+            ringBuffer.append(rawBytes); // <-- Vulnerable to mutation / corruption
+        }
+    }
+
+    public List<byte[]> getHistory() {
+        return ringBuffer.snapshot();   // <-- Unsafe if ringBuffer is null
+    }
+
+    public void clear() {
+        ringBuffer.clear();              // <-- Unsafe if ringBuffer is null
+    }
+}
+
+AFTER:
+--------------------------------------------------------------------------------
+public class StatePreserver {
+    public static final StatePreserver NO_OP = new NoOpStatePreserver();
+
+    private final ReplayRingBuffer ringBuffer;
+
+    public StatePreserver() {
+        this(ReplayRingBuffer.DEFAULT_CAPACITY);
+    }
+
+    public StatePreserver(int capacity) {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("Capacity must be positive: " + capacity);
+        }
+        this.ringBuffer = new ReplayRingBuffer(capacity);
+    }
+
+    protected StatePreserver(ReplayRingBuffer ringBuffer) {
+        this.ringBuffer = ringBuffer; // Allows NO_OP without allocating ringBuffer
+    }
+
+    public static StatePreserver create(boolean preserveState) {
+        return create(preserveState, ReplayRingBuffer.DEFAULT_CAPACITY);
+    }
+
+    public static StatePreserver create(boolean preserveState, int capacity) {
+        if (preserveState) {
+            return new StatePreserver(capacity);
+        }
+        return NO_OP; // Zero allocations
+    }
+
+    public static StatePreserver empty() {
+        return NO_OP;
+    }
+
+    public void save(byte[] rawBytes) {
+        if (rawBytes != null && ringBuffer != null) {
+            ringBuffer.append(rawBytes.clone()); // Defensive copy
+        }
+    }
+
+    public List<byte[]> getHistory() {
+        return ringBuffer != null ? ringBuffer.snapshot() : Collections.emptyList();
+    }
+
+    public void clear() {
+        if (ringBuffer != null) {
+            ringBuffer.clear();
+        }
+    }
+
+    private static final class NoOpStatePreserver extends StatePreserver {
+        private NoOpStatePreserver() {
+            super(null);
+        }
+
+        @Override public void save(byte[] rawBytes) {}
+        @Override public List<byte[]> getHistory() { return Collections.emptyList(); }
+        @Override public void clear() {}
+    }
+}
+
+--------------------------------------------------------------------------------
+4. VERIFICATION & UNIT TESTS
+--------------------------------------------------------------------------------
+Created test suite: session-engine/src/test/java/com/anilyanai/engine/session/StatePreserverTest.java
+Verified test coverage:
+  [PASS] testEphemeralSessionReusesSingleton (Validates singleton NO_OP reuse)
+  [PASS] testEphemeralSessionNoOp (Validates no-op behavior and empty history)
+  [PASS] testStatefulSessionPreservesHistory (Validates FIFO ordering and replay)
+  [PASS] testCustomCapacityFactory (Validates custom capacity buffer bounds)
+  [PASS] testDefensiveCopyingOnSave (Validates immunity to byte[] array mutation)
+  [PASS] testInvalidCapacityValidation (Validates IllegalArgumentException on invalid capacity)
+
+Project build verification:
+  Build status: SUCCESS (0 errors, 0 warnings)
+================================================================================
